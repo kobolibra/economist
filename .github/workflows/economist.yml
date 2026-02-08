@@ -2,8 +2,8 @@ name: Fetch and Process Economist
 
 on:
   schedule:
-    - cron: '0 1 * * 6'  # 每周六上午9点
-  workflow_dispatch:  # 允许手动触发
+    - cron: '0 1 * * 6'  # 北京时间周六上午9点
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -33,19 +33,44 @@ jobs:
         run: |
           mkdir -p input
           
-          # 获取最新文件夹
+          # 获取最新文件夹（格式：te_YYYY.MM.DD）
           LATEST_FOLDER=$(curl -s "https://api.github.com/repos/hehonghui/awesome-english-ebooks/contents/01_economist?ref=master" | \
-            python3 -c "import sys, json; folders=[i['name'] for i in json.load(sys.stdin) if i['type']=='dir']; print(sorted(folders)[-1])")
+            python3 -c "import sys, json; folders=[i['name'] for i in json.load(sys.stdin) if i['type']=='dir' and i['name'].startswith('te_')]; print(sorted(folders)[-1])")
           
           echo "Latest folder: $LATEST_FOLDER"
-          echo "FOLDER=$LATEST_FOLDER" >> $GITHUB_ENV
           
-          # 下载 EPUB
-          curl -L -o input/economist.epub \
-            "https://raw.githubusercontent.com/hehonghui/awesome-english-ebooks/master/01_economist/${LATEST_FOLDER}/economist.epub"
+          # 从文件夹名提取日期（te_2026.02.07 → 2026.02.07）
+          DATE_PART=$(echo "$LATEST_FOLDER" | sed 's/te_//')
+          echo "Date part: $DATE_PART"
           
-          ls -lh input/
-          echo "Downloaded successfully"
+          # 构建文件名：TheEconomist.YYYY.MM.DD.epub
+          FILENAME="TheEconomist.${DATE_PART}.epub"
+          echo "Filename: $FILENAME"
+          
+          # 构建下载链接
+          DOWNLOAD_URL="https://raw.githubusercontent.com/hehonghui/awesome-english-ebooks/master/01_economist/${LATEST_FOLDER}/${FILENAME}"
+          echo "Download URL: $DOWNLOAD_URL"
+          echo "URL=$DOWNLOAD_URL" >> $GITHUB_ENV
+          
+          # 下载
+          curl -L --fail -o input/economist.epub "$DOWNLOAD_URL"
+          
+          # 验证
+          echo "File size:"
+          ls -lh input/economist.epub
+          
+          echo "File type:"
+          file input/economist.epub || echo "file command not available"
+          
+          # 检查是否为有效 ZIP
+          if ! unzip -t input/economist.epub > /dev/null 2>&1; then
+            echo "Error: Not a valid ZIP file"
+            echo "First 500 bytes:"
+            head -c 500 input/economist.epub
+            exit 1
+          fi
+          
+          echo "Downloaded and verified successfully"
 
       - name: Process EPUB
         run: python scripts/process.py
