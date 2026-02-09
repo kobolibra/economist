@@ -61,59 +61,67 @@ def parse_html_file(filepath):
         return []
 
     articles = []
+    current_section = "Other"
 
-    h1s = body.find_all("h1")
+    # 识别 section 标题
+    for tag in body.find_all(["h1", "h2"]):
 
-    for h1 in h1s:
-        title = h1.get_text(strip=True)
-        if not title:
+        # section header
+        if tag.name == "h2":
+            current_section = tag.get_text(strip=True)
             continue
 
-        content_nodes = []
+        if tag.name == "h1":
+            title = tag.get_text(strip=True)
+            if not title:
+                continue
 
-        for sib in h1.next_siblings:
-            if getattr(sib, "name", None) == "h1":
-                break
-            content_nodes.append(str(sib))
+            content_nodes = [tag]
 
-        content_html = "".join(content_nodes).strip()
+            for sib in tag.next_siblings:
+                if getattr(sib, "name", None) == "h1":
+                    break
+                if getattr(sib, "name", None) == "h2":
+                    break
+                content_nodes.append(sib)
 
-        if len(content_html) < 200:
-            continue
+            article_html = "".join(str(x) for x in content_nodes)
 
-        # ✅ 修复图片路径
-        content_html = re.sub(
-            r'src=["\']([^"\']*?/)?([^/"\']+\.(jpg|jpeg|png|gif|svg|webp))["\']',
-            r'src="../images/\2"',
-            content_html,
-            flags=re.IGNORECASE
-        )
+            # 修复图片路径
+            article_html = re.sub(
+                r'src=["\']([^"\']*?/)?([^/"\']+\.(jpg|jpeg|png|gif|svg|webp))["\']',
+                r'src="../images/\2"',
+                article_html,
+                flags=re.IGNORECASE
+            )
 
-        slug = re.sub(r"[^\w\s-]", "", title).replace(" ", "-").lower()[:80]
-        path = f"articles/{slug}.html"
+            if len(article_html) < 200:
+                continue
 
-        write_article(path, title, content_html)
+            slug = re.sub(r"[^\w\s-]", "", title).replace(" ", "-").lower()[:80]
+            path = f"articles/{slug}.html"
 
-        articles.append({
-            "title": title,
-            "path": path
-        })
+            write_article(path, article_html)
+
+            articles.append({
+                "section": current_section,
+                "title": title,
+                "path": path
+            })
 
     return articles
 
 
 # --------------------------------------------------
 
-def write_article(path, title, content):
+def write_article(path, html_content):
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>{title}</title>
 </head>
 <body>
-<h1>{title}</h1>
-{content}
+{html_content}
 </body>
 </html>
 """
@@ -127,7 +135,13 @@ def write_article(path, title, content):
 def generate_index(articles):
     html = "<html><body><h1>Economist</h1>"
 
+    current_section = None
+
     for a in articles:
+        if a["section"] != current_section:
+            current_section = a["section"]
+            html += f"<h2>{current_section}</h2>"
+
         html += f'<div><a href="{a["path"]}">{a["title"]}</a></div>'
 
     html += "</body></html>"
