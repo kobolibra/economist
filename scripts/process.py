@@ -5,7 +5,7 @@ import zipfile
 import shutil
 import re
 from datetime import datetime
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup
 
 ALLOWED_SECTIONS = [
     "Leaders",
@@ -19,10 +19,10 @@ ALLOWED_SECTIONS = [
     "Culture"
 ]
 
-def normalize_section(name):
-    n = name.lower().strip()
+def normalize_section(text):
+    t = text.lower()
     for s in ALLOWED_SECTIONS:
-        if s.lower() in n or n in s.lower():
+        if s.lower() in t:
             return s
     return None
 
@@ -31,261 +31,136 @@ def main():
     print("Starting EPUB processing...")
     print("=" * 50)
     
-    if os.path.exists('output'):
-        shutil.rmtree('output')
-    if os.path.exists('temp_epub'):
-        shutil.rmtree('temp_epub')
+    shutil.rmtree('output', ignore_errors=True)
+    shutil.rmtree('temp_epub', ignore_errors=True)
     
     os.makedirs('output/articles', exist_ok=True)
     os.makedirs('output/images', exist_ok=True)
     
-    print("Extracting EPUB...")
     with zipfile.ZipFile('input/economist.epub', 'r') as z:
         z.extractall('temp_epub')
     
     copy_images('temp_epub', 'output/images')
     
-    sections_order = ALLOWED_SECTIONS[:]
-    print(f"\nUsing sections order: {sections_order}")
+    spine_files = get_spine_order('temp_epub')
     
     all_articles = []
-    processed_files = set()
-    
-    spine_files = get_spine_order('temp_epub')
-    print(f"Spine files: {len(spine_files)}")
     
     for filepath in spine_files:
-        if filepath in processed_files:
-            continue
-        
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            if 'The Economist' not in content and 'economist.com' not in content:
-                continue
-            
-            articles = parse_html_file(content, filepath, sections_order)
+                html = f.read()
+            articles = parse_html_file(html)
             all_articles.extend(articles)
-            processed_files.add(filepath)
-            
         except Exception as e:
-            print(f"Error in {os.path.basename(filepath)}: {e}")
+            print("Error:", e)
     
-    print(f"\nTotal articles: {len(all_articles)}")
+    print("Articles:", len(all_articles))
     
-    if not all_articles:
-        print("ERROR: No articles found!")
-        sys.exit(1)
-    
-    seen = set()
-    unique_articles = []
-    for art in all_articles:
-        if art['slug'] not in seen:
-            seen.add(art['slug'])
-            unique_articles.append(art)
-    
-    print(f"Unique articles: {len(unique_articles)}")
-    
-    generate_index(unique_articles, sections_order)
-    generate_rss(unique_articles)
-    
-    shutil.rmtree('temp_epub')
-    print(f"\nSuccess! Generated {len(unique_articles)} articles")
+    generate_index(all_articles)
+    print("Done.")
 
-def get_spine_order(epub_root):
-    files = []
-    opf_path = find_file(epub_root, '.opf')
-    if opf_path:
-        try:
-            with open(opf_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(content)
-            
-            manifest = {}
-            for item in root.findall('.//{http://www.idpf.org/2007/opf}item'):
-                item_id = item.get('id')
-                item_href = item.get('href')
-                if item_id and item_href:
-                    manifest[item_id] = os.path.join(os.path.dirname(opf_path), item_href)
-            
-            for itemref in root.findall('.//{http://www.idpf.org/2007/opf}itemref'):
-                item_id = itemref.get('idref')
-                if item_id in manifest:
-                    files.append(manifest[item_id])
-            
-        except Exception as e:
-            print(f"Error parsing spine: {e}")
-    
-    if not files:
-        for root, dirs, filenames in os.walk(epub_root):
-            for f in filenames:
-                if f.endswith(('.html', '.xhtml', '.htm')):
-                    files.append(os.path.join(root, f))
-        files.sort()
-    
-    return files
-
-def parse_html_file(html_content, filepath, sections_order):
-    articles = []
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    for tag in soup(['script', 'style']):
-        tag.decompose()
-    
+def parse_html_file(html):
+    soup = BeautifulSoup(html, 'html.parser')
     body = soup.find('body')
     if not body:
-        return articles
+        return []
     
-    # ✅ 修复图片路径 + 收集图片 HTML
-    image_html = []
-    for img in body.find_all('img'):
-        src = img.get('src', '')
-        filename = os.path.basename(src)
-        img['src'] = f"/images/{filename}"
-        image_html.append(str(img))
+    articles = []
     
-    image_block = "\n".join(image_html)
+    h1s = body.find_all('h1')
     
-    full_text = body.get_text('\n', strip=True)
-    
-    section_pattern = r'(Leaders|By Invitation|Briefing|China|International|Business|Finance & economics|Science & technology|Culture)\s*\|\s*([^\n]+)'
-    matches = list(re.finditer(section_pattern, full_text, re.IGNORECASE))
-    
-    for i, match in enumerate(matches):
-        section_name = normalize_section(match.group(1))
-        if not section_name:
+    for h1 in h1s:
+        title = h1.get_text(strip=True)
+        
+        # section 判断
+        section = None
+        prev = h1.find_previous(['h2','h3'])
+        if prev:
+            section = normalize_section(prev.get_text(strip=True))
+        
+        if not section:
             continue
         
-        subtitle = match.group(2).strip()
+        content_nodes = []
         
-        start = match.end()
-        end = matches[i+1].start() if i+1 < len(matches) else len(full_text)
-        section_text = full_text[start:end]
+        for sib in h1.next_siblings:
+            if getattr(sib, "name", None) == "h1":
+                break
+            content_nodes.append(str(sib))
         
-        # ✅ 把图片注入内容
-        section_text = image_block + "\n\n" + section_text
+        content_html = "".join(content_nodes)
         
-        article = parse_article_text(section_text, section_name, subtitle)
+        # 修复图片路径
+        content_html = re.sub(
+            r'src=["\']([^"\']*?/)?([^/"\']+\.(jpg|jpeg|png|gif|svg|webp))["\']',
+            r'src="../images/\2"',
+            content_html,
+            flags=re.IGNORECASE
+        )
+        
+        article = create_article(title, section, content_html)
         if article:
             articles.append(article)
-            print(f"  ✓ [{section_name}] {article['title'][:50]}...")
     
     return articles
 
-def parse_article_text(text, section_name, subtitle):
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
-    if not lines:
+def create_article(title, section, content):
+    if len(content) < 200:
         return None
     
-    title = ""
-    date = ""
-    content_start = 0
+    slug = re.sub(r'[^\w\s-]', '', title).replace(' ', '-').lower()[:60]
     
-    for i, line in enumerate(lines):
-        if line == subtitle:
-            continue
-        
-        if re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)', line):
-            date = line
-            content_start = i + 1
-            continue
-        
-        if not title and len(line) > 10 and line[0].isupper():
-            title = line
-            content_start = i + 1
-    
-    if not title:
-        title = subtitle
-    
-    content_lines = lines[content_start:]
-    content = '\n\n'.join(content_lines)
-    
-    if len(content) < 100:
-        return None
-    
-    return create_article(title, date, section_name, content)
-
-def create_article(title, date, section, content):
-    title = re.sub(r'\s+', ' ', title).strip()
-    slug = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '-').lower()[:50]
-    
-    base_slug = slug
-    counter = 1
-    while os.path.exists(f'output/articles/{slug}.html'):
-        slug = f"{base_slug}-{counter}"
-        counter += 1
-    
-    # ✅ 如果已经包含 HTML（图片），不要转纯文本
-    if '<img' not in content:
-        paragraphs = content.split('\n\n')
-        paragraphs = [f'<p>{p.strip()}</p>' for p in paragraphs if p.strip()]
-        content = '\n'.join(paragraphs)
-    
-    art_path = f'articles/{slug}.html'
+    path = f'articles/{slug}.html'
     
     html = f'''<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
 <meta charset="utf-8">
 <title>{title}</title>
 </head>
 <body>
-<div class="section">{section}</div>
+<div>{section}</div>
 <h1>{title}</h1>
-<div class="date">{date}</div>
 {content}
 </body>
 </html>'''
     
-    with open(f'output/{art_path}', 'w', encoding='utf-8') as f:
+    with open(f'output/{path}', 'w', encoding='utf-8') as f:
         f.write(html)
     
-    return {
-        'title': title,
-        'slug': slug,
-        'path': art_path,
-        'date': datetime.now().isoformat(),
-        'section': section
-    }
+    return {"title": title, "path": path, "section": section}
 
-def copy_images(source_dir, output_dir):
-    for r, dirs, files in os.walk(source_dir):
+def copy_images(src, dst):
+    for r,_,files in os.walk(src):
         for f in files:
-            if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp')):
-                src = os.path.join(r, f)
-                dst = os.path.join(output_dir, f)
-                if not os.path.exists(dst):
-                    shutil.copy2(src, dst)
+            if f.lower().endswith(('.jpg','.jpeg','.png','.gif','.svg','.webp')):
+                s = os.path.join(r,f)
+                d = os.path.join(dst,f)
+                if not os.path.exists(d):
+                    shutil.copy2(s,d)
 
-def generate_index(articles, sections_order):
-    by_section = {s: [] for s in sections_order}
-    for art in articles:
-        if art['section'] in by_section:
-            by_section[art['section']].append(art)
-    
+def generate_index(articles):
     html = "<html><body>"
-    for sec in sections_order:
-        if by_section[sec]:
-            html += f"<h2>{sec}</h2>"
-            for art in by_section[sec]:
-                html += f'<div><a href="{art["path"]}">{art["title"]}</a></div>'
+    current = None
+    for a in articles:
+        if a["section"] != current:
+            current = a["section"]
+            html += f"<h2>{current}</h2>"
+        html += f'<div><a href="{a["path"]}">{a["title"]}</a></div>'
     html += "</body></html>"
     
-    with open('output/index.html', 'w', encoding='utf-8') as f:
+    with open('output/index.html','w',encoding='utf-8') as f:
         f.write(html)
 
-def generate_rss(articles):
-    pass
-
-def find_file(root, filename):
-    for r, d, files in os.walk(root):
-        for f in files:
-            if f == filename or f.endswith(filename):
-                return os.path.join(r, f)
-    return None
+def get_spine_order(root):
+    files = []
+    for r,_,fs in os.walk(root):
+        for f in fs:
+            if f.endswith(('.html','.xhtml')):
+                files.append(os.path.join(r,f))
+    files.sort()
+    return files
 
 if __name__ == '__main__':
     main()
