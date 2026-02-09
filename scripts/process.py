@@ -7,7 +7,6 @@ import re
 from datetime import datetime
 from bs4 import BeautifulSoup, NavigableString
 
-# ✅ 只保留这些 section，顺序固定
 ALLOWED_SECTIONS = [
     "Leaders",
     "By Invitation",
@@ -44,10 +43,9 @@ def main():
     with zipfile.ZipFile('input/economist.epub', 'r') as z:
         z.extractall('temp_epub')
     
-    # ✅ 强化图片复制
     copy_images('temp_epub', 'output/images')
     
-    sections_order = ALLOWED_SECTIONS[:]  # 强制使用固定顺序
+    sections_order = ALLOWED_SECTIONS[:]
     print(f"\nUsing sections order: {sections_order}")
     
     all_articles = []
@@ -141,11 +139,15 @@ def parse_html_file(html_content, filepath, sections_order):
     if not body:
         return articles
     
-    # ✅ 修复图片路径（关键）
+    # ✅ 修复图片路径 + 收集图片 HTML
+    image_html = []
     for img in body.find_all('img'):
         src = img.get('src', '')
         filename = os.path.basename(src)
         img['src'] = f"/images/{filename}"
+        image_html.append(str(img))
+    
+    image_block = "\n".join(image_html)
     
     full_text = body.get_text('\n', strip=True)
     
@@ -162,6 +164,9 @@ def parse_html_file(html_content, filepath, sections_order):
         start = match.end()
         end = matches[i+1].start() if i+1 < len(matches) else len(full_text)
         section_text = full_text[start:end]
+        
+        # ✅ 把图片注入内容
+        section_text = image_block + "\n\n" + section_text
         
         article = parse_article_text(section_text, section_name, subtitle)
         if article:
@@ -213,9 +218,11 @@ def create_article(title, date, section, content):
         slug = f"{base_slug}-{counter}"
         counter += 1
     
-    paragraphs = content.split('\n\n')
-    paragraphs = [f'<p>{p.strip()}</p>' for p in paragraphs if p.strip()]
-    content = '\n'.join(paragraphs)
+    # ✅ 如果已经包含 HTML（图片），不要转纯文本
+    if '<img' not in content:
+        paragraphs = content.split('\n\n')
+        paragraphs = [f'<p>{p.strip()}</p>' for p in paragraphs if p.strip()]
+        content = '\n'.join(paragraphs)
     
     art_path = f'articles/{slug}.html'
     
@@ -245,7 +252,6 @@ def create_article(title, date, section, content):
     }
 
 def copy_images(source_dir, output_dir):
-    # ✅ 全量扫描媒体文件，不再依赖路径猜测
     for r, dirs, files in os.walk(source_dir):
         for f in files:
             if f.lower().endswith(('.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp')):
