@@ -3,13 +3,14 @@ import zipfile
 import shutil
 import re
 from bs4 import BeautifulSoup
+from collections import OrderedDict
 
 INPUT_EPUB = "input/economist.epub"
 
-# 需要保留的 sections，按优先级排序
+# 定义需要保留的 section，按此顺序展示
 TARGET_SECTIONS = [
     "Leaders",
-    "By Invitation", 
+    "By Invitation",
     "Briefing",
     "China",
     "International",
@@ -19,44 +20,62 @@ TARGET_SECTIONS = [
     "Culture"
 ]
 
+# Section 名称标准化映射（处理可能的变体）
+SECTION_ALIASES = {
+    "leader": "Leaders",
+    "leaders": "Leaders",
+    "by invitation": "By Invitation",
+    "briefing": "Briefing",
+    "china": "China",
+    "international": "International",
+    "business": "Business",
+    "finance & economics": "Finance & economics",
+    "finance and economics": "Finance & economics",
+    "science & technology": "Science & technology",
+    "science and technology": "Science & technology",
+    "culture": "Culture"
+}
+
+
 def main():
-    # 兼容旧版本 Python 的目录删除方式
-    if os.path.exists("temp_epub"):
-        shutil.rmtree("temp_epub")
-    if os.path.exists("output"):
-        shutil.rmtree("output")
+    shutil.rmtree("temp_epub", ignore_errors=True)
+    shutil.rmtree("output", ignore_errors=True)
 
     os.makedirs("temp_epub", exist_ok=True)
     os.makedirs("output/articles", exist_ok=True)
     os.makedirs("output/images", exist_ok=True)
-    os.makedirs("output/sections", exist_ok=True)
 
     unzip_epub()
     copy_images()
 
-    articles = []
-
+    # 使用 OrderedDict 保持顺序: section -> [articles]
+    sections = OrderedDict()
+    
     for root, _, files in os.walk("temp_epub"):
         for f in files:
             if f.endswith((".html", ".xhtml")):
                 path = os.path.join(root, f)
-                articles.extend(parse_html_file(path))
+                parse_html_file(path, sections)
 
-    # 按 section 组织文章，保持顺序
-    section_data = organize_by_section(articles)
-    
-    # 生成 section 页面（小目录）
-    for section, section_articles in section_data.items():
-        generate_section_page(section, section_articles)
-    
-    # 生成首页（大目录）
-    generate_index(section_data)
+    # 过滤并排序 sections
+    filtered_sections = OrderedDict()
+    for target in TARGET_SECTIONS:
+        for section_name, articles in sections.items():
+            if normalize_section_name(section_name) == target and articles:
+                filtered_sections[target] = articles
+                break
 
-    print("Done. Articles:", len(articles))
-    print("Sections:", list(section_data.keys()))
+    generate_index(filtered_sections)
+    print("Done. Sections:", len(filtered_sections))
 
 
 # --------------------------------------------------
+
+def normalize_section_name(name):
+    """标准化 section 名称"""
+    key = name.lower().strip()
+    return SECTION_ALIASES.get(key, name)
+
 
 def unzip_epub():
     with zipfile.ZipFile(INPUT_EPUB, "r") as z:
@@ -77,50 +96,44 @@ def copy_images():
 
 # --------------------------------------------------
 
-def parse_html_file(filepath):
+def parse_html_file(filepath, sections):
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         html = f.read()
 
     soup = BeautifulSoup(html, "html.parser")
     body = soup.find("body")
     if not body:
-        return []
+        return
 
-    articles = []
     current_section = None
 
-    # 识别 section 标题
-    for tag in body.find_all(["h1", "h2"]):
-
-        # section header
-        if tag.name == "h2":
-            section_name = tag.get_text(strip=True)
-            # 检查是否在目标 sections 中（不区分大小写匹配）
-            for target in TARGET_SECTIONS:
-                if section_name.lower() == target.lower():
-                    current_section = target  # 使用标准化的名称
-                    break
-            else:
-                current_section = None  # 不在目标列表中的 section
+    for tag in body.find_all(["h1", "h2", "h3", "h4"]):
+        text = tag.get_text(strip=True)
+        
+        # 识别 section header (h2 或 h3，通常是全大写或特定样式)
+        if tag.name in ["h2", "h3"]:
+            normalized = normalize_section_name(text)
+            if normalized in TARGET_SECTIONS:
+                current_section = normalized
+                if current_section not in sections:
+                    sections[current_section] = []
             continue
 
-        if tag.name == "h1":
-            # 跳过不在目标 section 中的文章
-            if current_section is None:
-                continue
-                
-            title = tag.get_text(strip=True)
-            if not title:
+        # 识别文章标题 (h1 或 h4，取决于 EPUB 结构)
+        if tag.name in ["h1", "h4"]:
+            title = text
+            if not title or len(title) < 3:
                 continue
 
-            content_nodes = [tag]
-
+            # 收集文章内容直到下一个标题
+            content_nodes = []
             for sib in tag.next_siblings:
-                if getattr(sib, "name", None) == "h1":
-                    break
-                if getattr(sib, "name", None) == "h2":
+                if getattr(sib, "name", None) in ["h1", "h2", "h3", "h4"]:
                     break
                 content_nodes.append(sib)
+
+            if not content_nodes:
+                continue
 
             article_html = "".join(str(x) for x in content_nodes)
 
@@ -132,7 +145,14 @@ def parse_html_file(filepath):
                 flags=re.IGNORECASE
             )
 
+            # 清理内容
+            article_html = clean_article_content(article_html)
+
             if len(article_html) < 200:
+                continue
+
+            # 如果没有识别到 section，跳过
+            if not current_section:
                 continue
 
             slug = re.sub(r"[^\w\s-]", "", title).replace(" ", "-").lower()[:80]
@@ -140,164 +160,242 @@ def parse_html_file(filepath):
 
             write_article(path, title, article_html, current_section)
 
-            articles.append({
-                "section": current_section,
+            sections[current_section].append({
                 "title": title,
                 "path": path
             })
 
-    return articles
 
-
-# --------------------------------------------------
-
-def organize_by_section(articles):
-    """按 section 组织文章，保持 section 顺序和文章顺序"""
-    section_order = []
-    section_articles = {}
+def clean_article_content(html):
+    """清理文章内容，移除不必要的标签"""
+    soup = BeautifulSoup(html, "html.parser")
     
-    for article in articles:
-        section = article["section"]
-        if section not in section_articles:
-            section_articles[section] = []
-            section_order.append(section)
-        section_articles[section].append(article)
+    # 移除脚本和样式标签
+    for tag in soup(["script", "style"]):
+        tag.decompose()
     
-    # 按 section_order 返回有序字典
-    return {section: section_articles[section] for section in section_order}
+    # 清理 class 和 id 属性，保留基本结构
+    for tag in soup.find_all(True):
+        # 保留一些基本的排版相关属性
+        keep_attrs = []
+        if tag.name == "img":
+            keep_attrs = ["src", "alt"]
+        elif tag.name in ["a", "p", "div", "span", "h1", "h2", "h3", "h4", "h5", "h6"]:
+            keep_attrs = ["class", "id"]
+        
+        # 移除不需要的属性
+        attrs_to_remove = [attr for attr in tag.attrs if attr not in keep_attrs]
+        for attr in attrs_to_remove:
+            del tag[attr]
+    
+    return str(soup)
 
 
 # --------------------------------------------------
 
 def write_article(path, title, html_content, section):
     html = f"""<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{title} | {section}</title>
-<style>
-    body {{
-        font-family: "Georgia", "Times New Roman", serif;
-        font-size: 18px;
-        line-height: 1.8;
-        color: #333;
-        max-width: 800px;
-        margin: 0 auto;
-        padding: 40px 20px;
-        background-color: #fff;
-    }}
-    .breadcrumb {{
-        font-size: 14px;
-        color: #666;
-        margin-bottom: 30px;
-        padding-bottom: 15px;
-        border-bottom: 1px solid #eee;
-    }}
-    .breadcrumb a {{
-        color: #e3120b;
-        text-decoration: none;
-    }}
-    .breadcrumb a:hover {{
-        text-decoration: underline;
-    }}
-    h1 {{
-        font-size: 32px;
-        font-weight: bold;
-        color: #e3120b;
-        margin-bottom: 20px;
-        line-height: 1.3;
-    }}
-    h2 {{
-        font-size: 24px;
-        font-weight: bold;
-        color: #333;
-        margin-top: 30px;
-        margin-bottom: 15px;
-    }}
-    h3 {{
-        font-size: 20px;
-        font-weight: bold;
-        color: #555;
-        margin-top: 25px;
-        margin-bottom: 10px;
-    }}
-    p {{
-        margin-bottom: 20px;
-        text-align: justify;
-        hyphens: auto;
-    }}
-    img {{
-        max-width: 100%;
-        height: auto;
-        display: block;
-        margin: 30px auto;
-    }}
-    figcaption {{
-        font-size: 14px;
-        color: #666;
-        text-align: center;
-        margin-top: -20px;
-        margin-bottom: 20px;
-        font-style: italic;
-    }}
-    .caption {{
-        font-size: 14px;
-        color: #666;
-        text-align: center;
-        margin-bottom: 20px;
-    }}
-    a {{
-        color: #e3120b;
-        text-decoration: none;
-    }}
-    a:hover {{
-        text-decoration: underline;
-    }}
-    strong {{
-        font-weight: bold;
-    }}
-    em {{
-        font-style: italic;
-    }}
-    blockquote {{
-        border-left: 4px solid #e3120b;
-        margin: 20px 0;
-        padding-left: 20px;
-        color: #555;
-        font-style: italic;
-    }}
-    ul, ol {{
-        margin-bottom: 20px;
-        padding-left: 30px;
-    }}
-    li {{
-        margin-bottom: 10px;
-    }}
-    .nav-links {{
-        margin-top: 40px;
-        padding-top: 20px;
-        border-top: 2px solid #eee;
-        display: flex;
-        justify-content: space-between;
-    }}
-    .nav-links a {{
-        color: #e3120b;
-        font-weight: bold;
-    }}
-</style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title} | The Economist</title>
+    <style>
+        /* Economist 风格基础排版 */
+        :root {{
+            --primary-color: #E3120B;
+            --text-color: #333;
+            --bg-color: #fff;
+            --secondary-bg: #f5f5f5;
+            --border-color: #ddd;
+            --font-serif: "Times New Roman", Times, Georgia, serif;
+            --font-sans: "Helvetica Neue", Helvetica, Arial, sans-serif;
+        }}
+        
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: var(--font-serif);
+            font-size: 18px;
+            line-height: 1.6;
+            color: var(--text-color);
+            background-color: var(--bg-color);
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }}
+        
+        /* 文章头部 */
+        .article-header {{
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 2px solid var(--primary-color);
+        }}
+        
+        .section-label {{
+            font-family: var(--font-sans);
+            font-size: 12px;
+            font-weight: bold;
+            text-transform: uppercase;
+            color: var(--primary-color);
+            letter-spacing: 1px;
+            margin-bottom: 10px;
+        }}
+        
+        .article-title {{
+            font-size: 32px;
+            line-height: 1.2;
+            font-weight: normal;
+            color: #000;
+            margin-bottom: 15px;
+        }}
+        
+        /* 副标题/导语样式 */
+        .flytitle, .rubric {{
+            font-family: var(--font-sans);
+            font-size: 16px;
+            color: #666;
+            font-weight: normal;
+            margin-bottom: 15px;
+            line-height: 1.4;
+        }}
+        
+        /* 段落样式 */
+        p {{
+            margin-bottom: 1em;
+            text-align: justify;
+            hyphens: auto;
+        }}
+        
+        /* 首字母大写效果（如果原文有） */
+        p.first-paragraph::first-letter {{
+            float: left;
+            font-size: 3.5em;
+            line-height: 0.8;
+            margin-right: 8px;
+            margin-top: 4px;
+            font-weight: bold;
+        }}
+        
+        /* 图片样式 */
+        img {{
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 30px auto;
+        }}
+        
+        figure {{
+            margin: 30px 0;
+        }}
+        
+        figcaption {{
+            font-family: var(--font-sans);
+            font-size: 14px;
+            color: #666;
+            text-align: center;
+            margin-top: 10px;
+            font-style: italic;
+        }}
+        
+        /* 小标题 */
+        h2, h3, h4 {{
+            font-family: var(--font-sans);
+            font-weight: bold;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            line-height: 1.3;
+        }}
+        
+        h2 {{
+            font-size: 24px;
+        }}
+        
+        h3 {{
+            font-size: 20px;
+        }}
+        
+        /* 引用块 */
+        blockquote {{
+            border-left: 3px solid var(--primary-color);
+            padding-left: 20px;
+            margin: 20px 0;
+            font-style: italic;
+            color: #555;
+        }}
+        
+        /* 链接 */
+        a {{
+            color: var(--primary-color);
+            text-decoration: none;
+        }}
+        
+        a:hover {{
+            text-decoration: underline;
+        }}
+        
+        /* 返回链接 */
+        .back-link {{
+            display: inline-block;
+            margin-top: 40px;
+            font-family: var(--font-sans);
+            font-size: 14px;
+            color: #666;
+        }}
+        
+        /* 分隔线 */
+        hr {{
+            border: none;
+            border-top: 1px solid var(--border-color);
+            margin: 30px 0;
+        }}
+        
+        /* 列表样式 */
+        ul, ol {{
+            margin-bottom: 1em;
+            padding-left: 2em;
+        }}
+        
+        li {{
+            margin-bottom: 0.5em;
+        }}
+        
+        /* 表格样式 */
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-family: var(--font-sans);
+            font-size: 14px;
+        }}
+        
+        th, td {{
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }}
+        
+        th {{
+            background-color: var(--secondary-bg);
+            font-weight: bold;
+        }}
+    </style>
 </head>
 <body>
-<div class="breadcrumb">
-    <a href="../index.html">Home</a> &gt; 
-    <a href="sections/{section.replace(" ", "-").lower()}.html">{section}</a> &gt; 
-    <span>{title}</span>
-</div>
-{html_content}
-<div class="nav-links">
-    <a href="sections/{section.replace(" ", "-").lower()}.html">← Back to {section}</a>
-    <a href="../index.html">Home →</a>
-</div>
+    <article>
+        <header class="article-header">
+            <div class="section-label">{section}</div>
+            <h1 class="article-title">{title}</h1>
+        </header>
+        <div class="article-content">
+            {html_content}
+        </div>
+        <a href="../index.html" class="back-link">← Back to index</a>
+    </article>
 </body>
 </html>
 """
@@ -308,293 +406,176 @@ def write_article(path, title, html_content, section):
 
 # --------------------------------------------------
 
-def generate_section_page(section, articles):
-    """生成每个 section 的小目录页面"""
-    section_slug = section.replace(" ", "-").lower()
-    
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{section} | The Economist</title>
-<style>
-    body {{
-        font-family: "Georgia", "Times New Roman", serif;
-        font-size: 16px;
-        line-height: 1.6;
-        color: #333;
-        max-width: 900px;
-        margin: 0 auto;
-        padding: 40px 20px;
-        background-color: #f5f5f5;
-    }}
-    .breadcrumb {{
-        font-size: 14px;
-        color: #666;
-        margin-bottom: 20px;
-    }}
-    .breadcrumb a {{
-        color: #e3120b;
-        text-decoration: none;
-    }}
-    .breadcrumb a:hover {{
-        text-decoration: underline;
-    }}
-    h1 {{
-        font-size: 42px;
-        font-weight: bold;
-        color: #e3120b;
-        margin-bottom: 10px;
-        border-bottom: 3px solid #e3120b;
-        padding-bottom: 20px;
-    }}
-    .section-desc {{
-        font-size: 18px;
-        color: #666;
-        margin-bottom: 30px;
-        font-style: italic;
-    }}
-    .article-count {{
-        font-size: 16px;
-        color: #666;
-        margin-bottom: 30px;
-    }}
-    .article-list {{
-        background-color: #fff;
-        padding: 30px;
-        border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }}
-    .article-item {{
-        margin-bottom: 20px;
-        padding: 15px;
-        border-left: 4px solid #e3120b;
-        padding-left: 20px;
-        transition: background-color 0.2s;
-        border-bottom: 1px solid #eee;
-    }}
-    .article-item:last-child {{
-        border-bottom: none;
-    }}
-    .article-item:hover {{
-        background-color: #f9f9f9;
-    }}
-    .article-item a {{
-        color: #333;
-        text-decoration: none;
-        font-size: 20px;
-        font-weight: 500;
-        display: block;
-        margin-bottom: 5px;
-    }}
-    .article-item a:hover {{
-        color: #e3120b;
-    }}
-    .article-index {{
-        font-size: 14px;
-        color: #999;
-        font-weight: normal;
-    }}
-    .back-link {{
-        margin-top: 30px;
-        text-align: center;
-    }}
-    .back-link a {{
-        color: #e3120b;
-        font-weight: bold;
-        font-size: 16px;
-    }}
-</style>
-</head>
-<body>
-<div class="breadcrumb">
-    <a href="../index.html">Home</a> &gt; 
-    <span>{section}</span>
-</div>
-<h1>{section}</h1>
-<div class="section-desc">The Economist - Weekly Edition</div>
-<div class="article-count">{len(articles)} articles in this section</div>
-<div class="article-list">
-"""
-
-    for idx, article in enumerate(articles, 1):
-        html += f'''
-    <div class="article-item">
-        <span class="article-index">{idx}.</span>
-        <a href="../{article["path"]}">{article["title"]}</a>
-    </div>
-'''
-
-    html += f'''
-</div>
-<div class="back-link">
-    <a href="../index.html">← Back to All Sections</a>
-</div>
-</body>
-</html>
-'''
-
-    with open(f"output/sections/{section_slug}.html", "w", encoding="utf-8") as f:
-        f.write(html)
-
-
-# --------------------------------------------------
-
-def generate_index(section_data):
-    """生成首页 - 大目录，展示所有 sections"""
+def generate_index(sections):
     html = """<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>The Economist - Weekly Edition</title>
-<style>
-    body {
-        font-family: "Georgia", "Times New Roman", serif;
-        font-size: 16px;
-        line-height: 1.6;
-        color: #333;
-        max-width: 1000px;
-        margin: 0 auto;
-        padding: 40px 20px;
-        background-color: #f5f5f5;
-    }
-    .header {
-        text-align: center;
-        margin-bottom: 50px;
-        padding-bottom: 30px;
-        border-bottom: 4px solid #e3120b;
-    }
-    h1 {
-        font-size: 52px;
-        font-weight: bold;
-        color: #e3120b;
-        margin-bottom: 10px;
-        letter-spacing: -1px;
-    }
-    .subtitle {
-        font-size: 20px;
-        color: #666;
-        font-style: italic;
-    }
-    .date {
-        font-size: 16px;
-        color: #999;
-        margin-top: 10px;
-    }
-    .sections-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-        gap: 25px;
-        margin-top: 30px;
-    }
-    .section-card {
-        background-color: #fff;
-        padding: 25px;
-        border-radius: 10px;
-        box-shadow: 0 3px 6px rgba(0,0,0,0.1);
-        transition: transform 0.2s, box-shadow 0.2s;
-        border-top: 4px solid #e3120b;
-    }
-    .section-card:hover {
-        transform: translateY(-3px);
-        box-shadow: 0 5px 15px rgba(0,0,0,0.15);
-    }
-    .section-card h2 {
-        font-size: 24px;
-        font-weight: bold;
-        color: #333;
-        margin-bottom: 10px;
-        margin-top: 0;
-    }
-    .section-card h2 a {
-        color: #333;
-        text-decoration: none;
-    }
-    .section-card h2 a:hover {
-        color: #e3120b;
-    }
-    .article-count {
-        font-size: 14px;
-        color: #666;
-        margin-bottom: 15px;
-        font-weight: 500;
-    }
-    .preview {
-        font-size: 14px;
-        color: #666;
-        line-height: 1.5;
-    }
-    .preview-item {
-        margin-bottom: 8px;
-        padding-left: 15px;
-        position: relative;
-    }
-    .preview-item:before {
-        content: "•";
-        color: #e3120b;
-        position: absolute;
-        left: 0;
-    }
-    .view-all {
-        margin-top: 15px;
-        font-size: 14px;
-        font-weight: bold;
-    }
-    .view-all a {
-        color: #e3120b;
-        text-decoration: none;
-    }
-    .view-all a:hover {
-        text-decoration: underline;
-    }
-    .footer {
-        margin-top: 50px;
-        text-align: center;
-        padding-top: 30px;
-        border-top: 2px solid #ddd;
-        color: #666;
-        font-size: 14px;
-    }
-</style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>The Economist - Weekly Edition</title>
+    <style>
+        :root {
+            --primary-color: #E3120B;
+            --text-color: #333;
+            --bg-color: #fff;
+            --secondary-bg: #f9f9f9;
+            --border-color: #e0e0e0;
+            --font-serif: "Times New Roman", Times, Georgia, serif;
+            --font-sans: "Helvetica Neue", Helvetica, Arial, sans-serif;
+        }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: var(--font-sans);
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            line-height: 1.6;
+        }
+        
+        /* 头部样式 */
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 30px 20px;
+            text-align: center;
+            border-bottom: 4px solid #b00;
+        }
+        
+        h1 {
+            font-family: var(--font-serif);
+            font-size: 42px;
+            font-weight: normal;
+            letter-spacing: -1px;
+        }
+        
+        .subtitle {
+            font-size: 14px;
+            margin-top: 10px;
+            opacity: 0.9;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        
+        /* 主内容区 */
+        main {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+        
+        /* Section 样式 */
+        .section {
+            margin-bottom: 50px;
+        }
+        
+        .section-header {
+            border-bottom: 3px solid var(--primary-color);
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .section-title {
+            font-family: var(--font-serif);
+            font-size: 24px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--primary-color);
+        }
+        
+        /* 文章列表 */
+        .article-list {
+            list-style: none;
+        }
+        
+        .article-item {
+            padding: 15px 0;
+            border-bottom: 1px solid var(--border-color);
+            transition: background-color 0.2s;
+        }
+        
+        .article-item:hover {
+            background-color: var(--secondary-bg);
+            margin: 0 -10px;
+            padding-left: 10px;
+            padding-right: 10px;
+        }
+        
+        .article-item:last-child {
+            border-bottom: none;
+        }
+        
+        .article-link {
+            text-decoration: none;
+            color: var(--text-color);
+            display: block;
+        }
+        
+        .article-link:hover {
+            color: var(--primary-color);
+        }
+        
+        .article-title-text {
+            font-family: var(--font-serif);
+            font-size: 20px;
+            font-weight: normal;
+            line-height: 1.3;
+        }
+        
+        /* 页脚 */
+        footer {
+            text-align: center;
+            padding: 40px 20px;
+            color: #666;
+            font-size: 14px;
+            border-top: 1px solid var(--border-color);
+            margin-top: 60px;
+        }
+    </style>
 </head>
 <body>
-<div class="header">
-    <h1>The Economist</h1>
-    <div class="subtitle">Weekly Edition</div>
-    <div class="date">February 7th 2026</div>
-</div>
-<div class="sections-grid">
+    <header>
+        <h1>The Economist</h1>
+        <div class="subtitle">Weekly Edition</div>
+    </header>
+    
+    <main>
 """
 
-    for section, articles in section_data.items():
-        section_slug = section.replace(" ", "-").lower()
-        article_count = len(articles)
-        
-        # 显示前3篇文章标题作为预览
-        preview_articles = articles[:3]
-        preview_html = ""
-        for article in preview_articles:
-            preview_html += f'<div class="preview-item">{article["title"][:60]}{"..." if len(article["title"]) > 60 else ""}</div>\n'
-        
+    for section_name, articles in sections.items():
+        if not articles:
+            continue
+            
         html += f'''
-    <div class="section-card">
-        <h2><a href="sections/{section_slug}.html">{section}</a></h2>
-        <div class="article-count">{article_count} articles</div>
-        <div class="preview">
-            {preview_html}
-        </div>
-        <div class="view-all"><a href="sections/{section_slug}.html">View all →</a></div>
-    </div>
+        <section class="section">
+            <div class="section-header">
+                <h2 class="section-title">{section_name}</h2>
+            </div>
+            <ul class="article-list">
+'''
+        
+        for article in articles:
+            html += f'''                <li class="article-item">
+                    <a href="{article["path"]}" class="article-link">
+                        <div class="article-title-text">{article["title"]}</div>
+                    </a>
+                </li>
+'''
+        
+        html += '''            </ul>
+        </section>
 '''
 
-    html += """
-</div>
-<div class="footer">
-    <p>© The Economist Newspaper Limited 2026. All rights reserved.</p>
-    <p>Automatically generated from EPUB</p>
-</div>
+    html += """    </main>
+    
+    <footer>
+        <p>Automatically generated from The Economist EPUB</p>
+    </footer>
 </body>
 </html>
 """
