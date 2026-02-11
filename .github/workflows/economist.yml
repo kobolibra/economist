@@ -2,7 +2,7 @@ name: Fetch and Process Economist
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # 北京时间周六上午9点
+    - cron: '20 0 * * 6'  # 北京时间周六上午9点
   workflow_dispatch:
 
 permissions:
