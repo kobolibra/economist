@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
 # --------------------------------------------------
-# 配置与常量 (保持不变)
+# 配置与常量
 # --------------------------------------------------
 
 INPUT_EPUB = "input/economist.epub"
@@ -110,7 +110,7 @@ def extract_edition_date(base_dir, ordered_files):
     return ""
 
 # --------------------------------------------------
-# 核心解析逻辑：自上而下状态流提取 Rubric
+# 核心修改：基于你的分析重构的解析逻辑
 # --------------------------------------------------
 
 def parse_html_file(filepath, current_section, css_filename):
@@ -120,40 +120,54 @@ def parse_html_file(filepath, current_section, css_filename):
     if not body: return [], current_section
 
     articles = []
-    last_found_rubric = "" # 记录最近发现的导读/副标题
+    last_found_rubric = ""
 
-    # 遍历所有标签，按顺序捕捉状态
+    # 遍历所有标签
     for tag in body.find_all(True):
-        # 1. 捕捉 Section 板块名
-        cls = str(tag.get("class", "")).lower()
-        if tag.name == "h2" or "section" in cls:
+        # 获取 class 列表并标准化
+        cls_raw = tag.get("class", [])
+        if isinstance(cls_raw, str): cls_raw = [cls_raw]
+        cls = " ".join(cls_raw).lower()
+        
+        # 1. 识别 Section 板块名
+        # 特征：h2 且 class 包含 section/department/part，且不在 article 容器内
+        if tag.name == "h2" and ("section" in cls or "department" in cls or "part" in cls):
             txt = tag.get_text(strip=True)
             if txt and len(txt) < 50:
                 current_section = txt
+            continue
 
-        # 2. 捕捉 Rubric 导读 (它是 h1 前面的那个短句)
-        if "rubric" in cls or "kicker" in cls:
+        # 2. 识别 Rubric/Kicker (页眉后面那部分)
+        # 特征：类名包含 rubric/kicker，或者是一个不带 section 类的 h2
+        if ("rubric" in cls or "kicker" in cls or 
+            (tag.name == "h2" and "section" not in cls and "part" not in cls)):
             txt = tag.get_text(strip=True)
-            if txt:
+            if txt and len(txt) < 100:
                 last_found_rubric = txt
+            continue
 
-        # 3. 捕捉到文章主标题 h1，开始组装
+        # 3. 捕捉文章主标题 h1
         if tag.name == "h1":
             title = tag.get_text(strip=True)
             if not title: continue
 
-            # 去重：如果 Rubric 内容和 Section 内容一样，就不加 Rubric 了
+            # --- 核心逻辑：组装 Fly-title 并去重 ---
             clean_sec = current_section.strip()
             clean_rub = last_found_rubric.strip()
             
-            if clean_rub and clean_rub.lower() != clean_sec.lower():
+            # 情况 A: Rubric 已经包含了 Section 名 (例如 "By Invitation | ...")
+            if clean_rub.lower().startswith(clean_sec.lower()):
+                header_display = clean_rub
+            # 情况 B: Rubric 是独立的内容且不等于 Section 名
+            elif clean_rub and clean_rub.lower() != clean_sec.lower():
                 header_display = f"{clean_sec} | {clean_rub}"
+            # 情况 C: 没有 Rubric 或 Rubric 重复了 Section
             else:
                 header_display = clean_sec
 
             fly_title_html = f'<div class="fly-title">{header_display}</div>'
             
-            # 收集文章内容 (直到下一个 h1 或 h2)
+            # 收集正文内容
             content_nodes = [tag]
             for sib in tag.next_siblings:
                 if getattr(sib, "name", None) in ["h1", "h2"]: break
@@ -171,7 +185,7 @@ def parse_html_file(filepath, current_section, css_filename):
             write_article(path, article_html, title, css_filename)
             articles.append({"section": current_section, "title": title, "path": path})
             
-            # 重要：处理完一个文章后，清空 Rubric 缓存，防止下一篇误用
+            # 处理完文章，重置 rubric 防止干扰下一篇
             last_found_rubric = ""
 
     return articles, current_section
@@ -188,7 +202,7 @@ def write_article(path, html_content, title, css_filename):
 <style>
     body {{ max-width: 800px; margin: 0 auto; padding: 30px 20px; font-family: Georgia, serif; background-color: #fdfdfd; color: #111; line-height: 1.6; }}
     img {{ max-width: 100%; height: auto; display: block; margin: 25px auto; }}
-    /* 页眉 Fly-title：保持原文大小写 */
+    /* 页眉保持原文大小写 */
     .fly-title {{ 
         font-size: 0.95em; 
         color: #e3120b; 
